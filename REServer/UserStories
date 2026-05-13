@@ -1,11 +1,11 @@
 User Stories for existing features:
-As a seller, I want to put up a property listing and wants to potentially change the price if I cant sell.
+As a seller, I want to put up a property listing and update the price if it isn't selling, so that I can attract more buyers and maximise my chances of making a sale.
 
-As a buyer I want to be able to see the price history of a listing and the dates for a listing.
+As a buyer, I want to see the full price history and dates for a listing, so that I can assess whether a property is fairly priced and how long it has been on the market.
 
-As a buyer I want to see properties given a postcode.
+As a buyer, I want to search for properties by postcode, so that I can find homes in my preferred area.
 
-As a buyer I want to be able to register as a buyer/purchaser.
+As a buyer, I want to register as a purchaser on the platform, so that I can save my preferences and interact with property listings.
 
 
 User Stories for future features:
