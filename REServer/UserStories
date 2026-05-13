@@ -1,7 +1,16 @@
+User Stories for existing features:
 As a seller, I want to put up a property listing and wants to potentially change the price if I cant sell.
 
 As a buyer I want to be able to see the price history of a listing and the dates for a listing.
 
 As a buyer I want to see properties given a postcode.
 
-As a buyer I want to be able to register as a buyer/purchaser
+As a buyer I want to be able to register as a buyer/purchaser.
+
+
+User Stories for future features:
+As a buyer, I want to submit a formal offer on a listed property, so that the seller can review and accept or reject it.
+
+As an agent, I want to see the zip codes that have the highest interest, so that I can identify where the most buyers are looking and target my property listings accordingly.
+
+As a buyer, I want to see notifications when the listings price drops, so that I know when to purchase.
