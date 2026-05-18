@@ -64,6 +64,87 @@ public class PropertyDAO {
         }
     }
 
+    public void incrementPropertyAccessCount(String propertyID) {
+        String sql =
+            "update property set access_count = coalesce(access_count, 0) + 1 "
+                + "where property_id = ?";
+
+        try (Connection connection = DatabaseConfig.connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+
+            statement.setLong(1, Long.parseLong(propertyID));
+            statement.executeUpdate();
+        } catch (SQLException exception) {
+            throw new IllegalStateException(
+                "Failed to increment access count for property " + propertyID,
+                exception
+            );
+        }
+    }
+
+    public Optional<Long> getPropertyAccessCount(String propertyID) {
+        String sql = "select access_count from property where property_id = ?";
+
+        try (Connection connection = DatabaseConfig.connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+
+            statement.setLong(1, Long.parseLong(propertyID));
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return Optional.empty();
+                }
+                return Optional.of(resultSet.getLong("access_count"));
+            }
+        } catch (SQLException exception) {
+            throw new IllegalStateException(
+                "Failed to read access count for property " + propertyID,
+                exception
+            );
+        }
+    }
+
+    public void incrementPostCodeSearchCount(String postCode) {
+        String sql =
+            "insert into post_code_search_stat (post_code, search_count) values (?, 1) "
+                + "on conflict (post_code) do update set search_count = "
+                + "post_code_search_stat.search_count + 1";
+
+        try (Connection connection = DatabaseConfig.connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+
+            statement.setString(1, postCode);
+            statement.executeUpdate();
+        } catch (SQLException exception) {
+            throw new IllegalStateException(
+                "Failed to increment search count for postcode " + postCode,
+                exception
+            );
+        }
+    }
+
+    public Optional<Long> getPostCodeSearchCount(String postCode) {
+        String sql = "select search_count from post_code_search_stat where post_code = ?";
+
+        try (Connection connection = DatabaseConfig.connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+
+            statement.setString(1, postCode);
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return Optional.empty();
+                }
+                return Optional.of(resultSet.getLong("search_count"));
+            }
+        } catch (SQLException exception) {
+            throw new IllegalStateException(
+                "Failed to read search count for postcode " + postCode,
+                exception
+            );
+        }
+    }
+
     public List<Property> getPropertiesByPostCode(String postCode) {
         String sql =
             "select " + SELECT_COLUMNS + " from property where post_code = ? "

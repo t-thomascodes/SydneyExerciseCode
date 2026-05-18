@@ -30,19 +30,24 @@ public class NotifyDAO {
         return lastFetchTruncated;
     }
 
+    public List<NotificationMatch> fetchPurchaseNotifications() {
+        return fetchPurchaseNotifications(NotifyFilters.NONE);
+    }
+
     /**
      * For each purchaser, returns for-sale properties in postcodes they follow.
      * <p>
      * Price rule: latest {@code listing_price} row for the chosen listing (highest {@code listing_id}
      * per property that has any price history), otherwise {@code property.purchase_price}.
-     * </p>
-     * <p>
-     * Uses schema table names {@code listing} and {@code listing_price} (matches course ERD / Supabase).
+     * Rows include {@code access_count} and postcode {@code search_count}; results are ordered by
+     * purchaser, then descending property views, then property id.
      * </p>
      */
-    public List<NotificationMatch> fetchPurchaseNotifications() {
+    public List<NotificationMatch> fetchPurchaseNotifications(NotifyFilters filters) {
         lastFetchTruncated = false;
-        String sql =
+        NotifyFilters effective = filters == null ? NotifyFilters.NONE : filters;
+
+        StringBuilder sql = new StringBuilder(
             "with latest_price_per_listing as ("
                 + "  select distinct on (listing_id) listing_id, price as latest_price"
                 + "  from listing_price"
@@ -56,24 +61,48 @@ public class NotifyDAO {
                 + ")"
                 + "select"
                 + "  p.purchaser_id,"
-                + "  p.email,"
-                + "  p.first_name,"
-                + "  p.last_name,"
+                + "  coalesce(per.email, '') as email,"
+                + "  coalesce(per.first_name, '') as first_name,"
+                + "  coalesce(per.last_name, '') as last_name,"
                 + "  pr.property_id,"
-                + "  coalesce(clp.latest_price, pr.purchase_price) as sale_price"
+                + "  trim(pr.post_code) as post_code,"
+                + "  coalesce(clp.latest_price, pr.purchase_price) as sale_price,"
+                + "  coalesce(pr.access_count, 0) as access_count,"
+                + "  coalesce(pcs.search_count, 0) as postcode_search_count"
                 + " from purchaser p"
+                + " left join person per on per.person_id = p.person_id"
                 + " inner join purchaser_interest pi on pi.purchaser_id = p.purchaser_id"
                 + " inner join property pr"
                 + "  on trim(pr.post_code) = trim(pi.post_code)"
                 + " and pr.for_sale = true"
+                + " left join post_code_search_stat pcs on trim(pcs.post_code) = trim(pr.post_code)"
                 + " left join chosen_listing_per_property clp on clp.property_id = pr.property_id"
-                + " order by p.purchaser_id, pr.property_id"
-                + " limit ?";
+                + " where 1=1"
+        );
+
+        List<Object> bindValues = new ArrayList<>();
+        effective.minAccess().ifPresent(min -> {
+            sql.append(" and coalesce(pr.access_count, 0) >= ?");
+            bindValues.add(min);
+        });
+        effective.effectiveMinPostcodeSearches().ifPresent(min -> {
+            sql.append(" and coalesce(pcs.search_count, 0) >= ?");
+            bindValues.add(min);
+        });
+
+        sql.append(
+            " order by p.purchaser_id, coalesce(pr.access_count, 0) desc, pr.property_id"
+                + " limit ?"
+        );
+        bindValues.add((long) NOTIFY_MAX_ROWS + 1);
 
         try (Connection connection = DatabaseConfig.connect();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
+             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
 
-            statement.setInt(1, NOTIFY_MAX_ROWS + 1);
+            for (int i = 0; i < bindValues.size(); i++) {
+                statement.setLong(i + 1, (Long) bindValues.get(i));
+            }
+
             List<NotificationMatch> out = new ArrayList<>();
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
@@ -97,7 +126,10 @@ public class NotifyDAO {
             rs.getString("first_name"),
             rs.getString("last_name"),
             rs.getLong("property_id"),
-            rs.getLong("sale_price")
+            rs.getString("post_code"),
+            rs.getLong("sale_price"),
+            rs.getLong("access_count"),
+            rs.getLong("postcode_search_count")
         );
     }
 

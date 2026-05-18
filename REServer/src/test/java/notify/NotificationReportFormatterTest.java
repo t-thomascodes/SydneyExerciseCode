@@ -11,15 +11,33 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Unit tests for {@link NotificationReportFormatter}: turning {@link NotificationMatch} rows into
  * plain text or HTML for {@code GET /notify}.
- * <p>
- * These tests use <strong>in-memory lists only</strong> (no Javalin, no Postgres). They prove the
- * report layout, grouping, and escaping rules that the DAO is expected to feed with sorted rows
- * from {@link NotifyDAO#fetchPurchaseNotifications()}.
- * </p>
  */
 class NotificationReportFormatterTest {
 
-    /** User-controlled fields (names, emails) must not break HTML; special chars become entities. */
+    private static NotificationMatch match(
+        long purchaserId,
+        String email,
+        String first,
+        String last,
+        long propertyId,
+        String postCode,
+        long salePrice,
+        long accessCount,
+        long postcodeSearchCount
+    ) {
+        return new NotificationMatch(
+            purchaserId,
+            email,
+            first,
+            last,
+            propertyId,
+            postCode,
+            salePrice,
+            accessCount,
+            postcodeSearchCount
+        );
+    }
+
     @Test
     void escapeHtml_escapesSpecialCharacters() {
         assertEquals("", NotificationReportFormatter.escapeHtml(""));
@@ -28,16 +46,12 @@ class NotificationReportFormatterTest {
         assertEquals("&quot;x&quot;", NotificationReportFormatter.escapeHtml("\"x\""));
     }
 
-    /**
-     * DAO orders by purchaser then property; the formatter groups consecutive rows with the same
-     * {@code purchaserId} so each purchaser gets one block in the report.
-     */
     @Test
     void groupByPurchaserInOrder_splitsByPurchaserId() {
         List<NotificationMatch> rows = List.of(
-            new NotificationMatch(1, "a@example.com", "A", "One", 10, 100_000L),
-            new NotificationMatch(1, "a@example.com", "A", "One", 11, 200_000L),
-            new NotificationMatch(2, "b@course.edu", "B", "Two", 20, 300_000L)
+            match(1, "a@example.com", "A", "One", 10, "2000", 100_000L, 1, 5),
+            match(1, "a@example.com", "A", "One", 11, "2000", 200_000L, 2, 5),
+            match(2, "b@course.edu", "B", "Two", 20, "2010", 300_000L, 0, 1)
         );
         List<List<NotificationMatch>> groups = NotificationReportFormatter.groupByPurchaserInOrder(rows);
         assertEquals(2, groups.size());
@@ -47,66 +61,58 @@ class NotificationReportFormatterTest {
         assertEquals(20, groups.get(1).get(0).propertyId());
     }
 
-    /**
-     * End-to-end for the text report: one purchaser, two properties — output must contain header
-     * (id, name, email) and both property lines with the expected {@code sale_price} digits.
-     */
     @Test
-    void formatPlainText_includesPurchaserEmailAndPropertyLines() {
+    void formatPlainText_includesMetricsAndTrendingPostcodes() {
         List<NotificationMatch> rows = List.of(
-            new NotificationMatch(
-                42,
-                "buyer42@university.edu",
-                "Jane",
-                "Doe",
-                1001,
-                850_000L
-            ),
-            new NotificationMatch(
-                42,
-                "buyer42@university.edu",
-                "Jane",
-                "Doe",
-                1002,
-                920_000L
-            )
+            match(42, "buyer42@university.edu", "Jane", "Doe", 1001, "2000", 850_000L, 12, 40),
+            match(42, "buyer42@university.edu", "Jane", "Doe", 1002, "2000", 920_000L, 3, 40)
         );
         String text = NotificationReportFormatter.formatPlainText(rows, false);
         assertTrue(text.contains("Purchaser 42"));
         assertTrue(text.contains("buyer42@university.edu"));
+        assertTrue(text.contains("Trending postcodes"));
+        assertTrue(text.contains("2000 (40 searches)"));
         assertTrue(text.contains("property_id=1001"));
-        assertTrue(text.contains("sale_price=850000"));
+        assertTrue(text.contains("views=12"));
         assertTrue(text.contains("property_id=1002"));
+        assertTrue(text.contains("views=3"));
         assertFalse(text.contains("[Report truncated"));
     }
 
-    /** When the DAO returns no rows, the text body still explains that nothing matched (not a blank page). */
+    @Test
+    void sortByAccessDesc_ordersPropertiesByViews() {
+        List<NotificationMatch> rows = List.of(
+            match(1, "a@x.com", "A", "B", 1, "2000", 1, 2, 0),
+            match(1, "a@x.com", "A", "B", 2, "2000", 1, 9, 0)
+        );
+        List<NotificationMatch> sorted = NotificationReportFormatter.sortByAccessDesc(rows);
+        assertEquals(2, sorted.get(0).propertyId());
+        assertEquals(1, sorted.get(1).propertyId());
+    }
+
     @Test
     void formatPlainText_emptyExplainsNoMatches() {
         String text = NotificationReportFormatter.formatPlainText(List.of(), false);
         assertTrue(text.contains("No matching"));
     }
 
-    /** When the row cap is hit in the DAO, the formatter appends a truncation line so users know the report was cut off. */
     @Test
     void formatPlainText_truncationNotice() {
         String text = NotificationReportFormatter.formatPlainText(List.of(), true);
         assertTrue(text.contains("truncated"));
     }
 
-    /**
-     * HTML report wraps matches in a table; the purchaser line is escaped so a malicious-looking
-     * name cannot inject tags (e.g. {@code <Evil>}) into the document.
-     */
     @Test
-    void formatHtml_containsTableAndEscapesHeader() {
+    void formatHtml_containsMetricsColumnsAndEscapesHeader() {
         List<NotificationMatch> rows = List.of(
-            new NotificationMatch(7, "evil@x.com", "<Evil>", "Name", 1, 1L)
+            match(7, "evil@x.com", "<Evil>", "Name", 1, "2000", 1, 5, 10)
         );
         String html = NotificationReportFormatter.formatHtml(rows, false);
         assertTrue(html.contains("<!DOCTYPE html>"));
-        assertTrue(html.contains("<table"));
-        assertTrue(html.contains("<td>1</td>"));
+        assertTrue(html.contains("<th>Views</th>"));
+        assertTrue(html.contains("<th>Postcode searches</th>"));
+        assertTrue(html.contains("<td>5</td>"));
+        assertTrue(html.contains("<td>10</td>"));
         assertTrue(html.contains("&lt;Evil&gt;"));
         assertFalse(html.contains("<Evil>"));
     }

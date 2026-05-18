@@ -15,4 +15,13 @@ public record NotifyDiagnostics(
     List<String> sampleForSalePropertyPostcodesTrimmed,
     List<String> hints
 ) {
+    public NotifyDiagnostics {
+        sampleInterestPostcodesTrimmed =
+            sampleInterestPostcodesTrimmed == null ? List.of() : List.copyOf(sampleInterestPostcodesTrimmed);
+        sampleForSalePropertyPostcodesTrimmed =
+            sampleForSalePropertyPostcodesTrimmed == null
+                ? List.of()
+                : List.copyOf(sampleForSalePropertyPostcodesTrimmed);
+        hints = hints == null ? List.of() : List.copyOf(hints);
+    }
 }

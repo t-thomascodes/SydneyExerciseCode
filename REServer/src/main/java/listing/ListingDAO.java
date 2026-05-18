@@ -90,9 +90,9 @@ public class ListingDAO {
                         return Optional.empty();
                     }
                     detail = new ListingDetail();
-                    detail.listingID = String.valueOf(resultSet.getLong("listing_id"));
-                    detail.propertyID = String.valueOf(resultSet.getLong("property_id"));
-                    detail.listedOn = resultSet.getDate("datelisted").toLocalDate().toString();
+                    detail.setListingID(String.valueOf(resultSet.getLong("listing_id")));
+                    detail.setPropertyID(String.valueOf(resultSet.getLong("property_id")));
+                    detail.setListedOn(resultSet.getDate("datelisted").toLocalDate().toString());
                 }
             }
 
@@ -107,7 +107,7 @@ public class ListingDAO {
                     }
                 }
             }
-            detail.prices = prices;
+            detail.setPrices(prices);
             return Optional.of(detail);
         } catch (SQLException exception) {
             throw new IllegalStateException("Failed to load listing " + listingId, exception);
