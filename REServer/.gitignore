@@ -39,3 +39,6 @@ build/
 
 ### Local secrets ###
 .env
+*-firebase-adminsdk*.json
+serviceAccount.json
+firebase-credentials.json

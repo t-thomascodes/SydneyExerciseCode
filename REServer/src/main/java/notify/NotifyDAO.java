@@ -1,28 +1,44 @@
 package notify;
 
-import app.DatabaseConfig;
+import app.FirestoreCollections;
+import app.FirestoreConfig;
+import app.FirestoreOps;
+import app.PostcodeUtil;
+import com.google.cloud.firestore.DocumentSnapshot;
+import com.google.cloud.firestore.QueryDocumentSnapshot;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
- * Loads purchaser ↔ for-sale property matches in one round trip using set-based SQL
- * (CTEs + DISTINCT ON), suitable for large property tables when indexes exist on
- * {@code purchaser_interest(post_code)} and {@code property(post_code, for_sale)}.
+ * Loads purchaser ↔ for-sale property matches using Firestore collections and in-memory
+ * joins (equivalent to the original Postgres CTE + join query).
  */
 public class NotifyDAO {
 
-    /**
-     * Hard cap on returned rows so a single HTTP response cannot exhaust heap if data grows unexpectedly.
-     */
     public static final int NOTIFY_MAX_ROWS = 50_000;
+
+    private static final String FIELD_PURCHASER_ID = "purchaserId";
+    private static final String FIELD_EMAIL = "email";
+    private static final String FIELD_FIRST_NAME = "firstName";
+    private static final String FIELD_LAST_NAME = "lastName";
+    private static final String FIELD_POST_CODE = "postCode";
+    private static final String FIELD_PROPERTY_ID = "propertyId";
+    private static final String FIELD_PURCHASE_PRICE = "purchasePrice";
+    private static final String FIELD_FOR_SALE = "forSale";
+    private static final String FIELD_ACCESS_COUNT = "accessCount";
+    private static final String FIELD_SEARCH_COUNT = "searchCount";
+    private static final String FIELD_LISTING_ID = "listingId";
+    private static final String FIELD_PRICE_ID = "priceId";
+    private static final String FIELD_PRICE_DATE = "priceDate";
+    private static final String FIELD_PRICE = "price";
 
     private boolean lastFetchTruncated;
 
@@ -34,173 +50,285 @@ public class NotifyDAO {
         return fetchPurchaseNotifications(NotifyFilters.NONE);
     }
 
-    /**
-     * For each purchaser, returns for-sale properties in postcodes they follow.
-     * <p>
-     * Price rule: latest {@code listing_price} row for the chosen listing (highest {@code listing_id}
-     * per property that has any price history), otherwise {@code property.purchase_price}.
-     * Rows include {@code access_count} and postcode {@code search_count}; results are ordered by
-     * purchaser, then descending property views, then property id.
-     * </p>
-     */
     public List<NotificationMatch> fetchPurchaseNotifications(NotifyFilters filters) {
         lastFetchTruncated = false;
         NotifyFilters effective = filters == null ? NotifyFilters.NONE : filters;
 
-        StringBuilder sql = new StringBuilder(
-            "with latest_price_per_listing as ("
-                + "  select distinct on (listing_id) listing_id, price as latest_price"
-                + "  from listing_price"
-                + "  order by listing_id, price_date desc, price_id desc"
-                + "),"
-                + "chosen_listing_per_property as ("
-                + "  select distinct on (l.property_id) l.property_id, lp.latest_price"
-                + "  from listing l"
-                + "  inner join latest_price_per_listing lp on lp.listing_id = l.listing_id"
-                + "  order by l.property_id, l.listing_id desc"
-                + ")"
-                + "select"
-                + "  p.purchaser_id,"
-                + "  coalesce(per.email, '') as email,"
-                + "  coalesce(per.first_name, '') as first_name,"
-                + "  coalesce(per.last_name, '') as last_name,"
-                + "  pr.property_id,"
-                + "  trim(pr.post_code) as post_code,"
-                + "  coalesce(clp.latest_price, pr.purchase_price) as sale_price,"
-                + "  coalesce(pr.access_count, 0) as access_count,"
-                + "  coalesce(pcs.search_count, 0) as postcode_search_count"
-                + " from purchaser p"
-                + " left join person per on per.person_id = p.person_id"
-                + " inner join purchaser_interest pi on pi.purchaser_id = p.purchaser_id"
-                + " inner join property pr"
-                + "  on trim(pr.post_code) = trim(pi.post_code)"
-                + " and pr.for_sale = true"
-                + " left join post_code_search_stat pcs on trim(pcs.post_code) = trim(pr.post_code)"
-                + " left join chosen_listing_per_property clp on clp.property_id = pr.property_id"
-                + " where 1=1"
-        );
+        try {
+            List<PurchaserRow> purchasers = loadPurchasers();
+            List<InterestRow> interests = loadInterests();
+            List<PropertyRow> forSaleProperties = loadForSaleProperties();
+            Map<String, Long> searchCounts = loadPostCodeSearchCounts();
+            Map<Long, Long> salePriceByProperty = buildSalePriceByProperty();
 
-        List<Object> bindValues = new ArrayList<>();
-        effective.minAccess().ifPresent(min -> {
-            sql.append(" and coalesce(pr.access_count, 0) >= ?");
-            bindValues.add(min);
-        });
-        effective.effectiveMinPostcodeSearches().ifPresent(min -> {
-            sql.append(" and coalesce(pcs.search_count, 0) >= ?");
-            bindValues.add(min);
-        });
-
-        sql.append(
-            " order by p.purchaser_id, coalesce(pr.access_count, 0) desc, pr.property_id"
-                + " limit ?"
-        );
-        bindValues.add((long) NOTIFY_MAX_ROWS + 1);
-
-        try (Connection connection = DatabaseConfig.connect();
-             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
-
-            for (int i = 0; i < bindValues.size(); i++) {
-                statement.setLong(i + 1, (Long) bindValues.get(i));
+            Map<Long, List<InterestRow>> interestsByPurchaser = new HashMap<>();
+            for (InterestRow interest : interests) {
+                interestsByPurchaser
+                    .computeIfAbsent(interest.purchaserId(), ignored -> new ArrayList<>())
+                    .add(interest);
             }
 
-            List<NotificationMatch> out = new ArrayList<>();
-            try (ResultSet rs = statement.executeQuery()) {
-                while (rs.next()) {
-                    if (out.size() == NOTIFY_MAX_ROWS) {
-                        lastFetchTruncated = true;
-                        break;
+            List<NotificationMatch> matches = new ArrayList<>();
+            purchasers.sort(Comparator.comparingLong(PurchaserRow::purchaserId));
+
+            for (PurchaserRow purchaser : purchasers) {
+                for (InterestRow interest : interestsByPurchaser.getOrDefault(
+                    purchaser.purchaserId(),
+                    List.of()
+                )) {
+                    for (PropertyRow property : forSaleProperties) {
+                        if (!PostcodeUtil.matchesTrimmed(property.postCode(), interest.postCode())) {
+                            continue;
+                        }
+                        long accessCount = property.accessCount() == null ? 0L : property.accessCount();
+                        long postcodeSearchCount = lookupSearchCount(searchCounts, property.postCode());
+                        if (effective.minAccess().isPresent()
+                            && accessCount < effective.minAccess().getAsLong()) {
+                            continue;
+                        }
+                        if (effective.effectiveMinPostcodeSearches().isPresent()
+                            && postcodeSearchCount < effective.effectiveMinPostcodeSearches().getAsLong()) {
+                            continue;
+                        }
+                        long salePrice = salePriceByProperty.getOrDefault(
+                            property.propertyId(),
+                            property.purchasePrice()
+                        );
+                        matches.add(
+                            new NotificationMatch(
+                                purchaser.purchaserId(),
+                                purchaser.email(),
+                                purchaser.firstName(),
+                                purchaser.lastName(),
+                                property.propertyId(),
+                                PostcodeUtil.trim(property.postCode()),
+                                salePrice,
+                                accessCount,
+                                postcodeSearchCount
+                            )
+                        );
                     }
-                    out.add(mapRow(rs));
                 }
             }
-            return out;
-        } catch (SQLException exception) {
+
+            matches.sort(
+                Comparator.comparingLong(NotificationMatch::purchaserId)
+                    .thenComparing(NotificationMatch::accessCount, Comparator.reverseOrder())
+                    .thenComparingLong(NotificationMatch::propertyId)
+            );
+
+            if (matches.size() > NOTIFY_MAX_ROWS) {
+                lastFetchTruncated = true;
+                return List.copyOf(matches.subList(0, NOTIFY_MAX_ROWS));
+            }
+            return matches;
+        } catch (IllegalStateException exception) {
             throw new IllegalStateException("Failed to load purchase notifications", exception);
         }
     }
 
-    private static NotificationMatch mapRow(ResultSet rs) throws SQLException {
-        return new NotificationMatch(
-            rs.getLong("purchaser_id"),
-            rs.getString("email"),
-            rs.getString("first_name"),
-            rs.getString("last_name"),
-            rs.getLong("property_id"),
-            rs.getString("post_code"),
-            rs.getLong("sale_price"),
-            rs.getLong("access_count"),
-            rs.getLong("postcode_search_count")
-        );
-    }
-
-    /**
-     * Lightweight counts and postcode samples for debugging empty {@link #fetchPurchaseNotifications()} results.
-     */
     public NotifyDiagnostics fetchDiagnostics() {
-        try (Connection connection = DatabaseConfig.connect()) {
-            long purchaserCount = queryLong(connection, "select count(*) from purchaser");
-            long interestCount = queryLong(connection, "select count(*) from purchaser_interest");
-            long forSaleCount = queryLong(
-                connection, "select count(*) from property where for_sale = true"
+        try {
+            List<PurchaserRow> purchasers = loadPurchasers();
+            List<InterestRow> interests = loadInterests();
+            List<PropertyRow> forSaleProperties = loadForSaleProperties();
+
+            long pairMatchCount = 0L;
+            for (InterestRow interest : interests) {
+                for (PropertyRow property : forSaleProperties) {
+                    if (PostcodeUtil.matchesTrimmed(property.postCode(), interest.postCode())) {
+                        pairMatchCount++;
+                    }
+                }
+            }
+
+            List<String> sampleInterest = distinctTrimmedPostcodes(
+                interests.stream().map(InterestRow::postCode).toList()
             );
-            long pairMatchCount = queryLong(
-                connection,
-                "select count(*) from purchaser_interest pi"
-                    + " inner join property pr on trim(pr.post_code) = trim(pi.post_code)"
-                    + " and pr.for_sale = true"
+            List<String> sampleForSale = distinctTrimmedPostcodes(
+                forSaleProperties.stream().map(PropertyRow::postCode).toList()
             );
-            List<String> sampleInterest = distinctPostcodes(
-                connection,
-                "select distinct trim(post_code) as pc from purchaser_interest"
-                    + " where trim(post_code) <> '' order by pc nulls last limit 20"
-            );
-            List<String> sampleForSale = distinctPostcodes(
-                connection,
-                "select distinct trim(post_code) as pc from property"
-                    + " where for_sale = true and trim(post_code) <> '' order by pc nulls last limit 20"
-            );
+
             List<String> hints = buildHints(
-                purchaserCount,
-                interestCount,
-                forSaleCount,
+                purchasers.size(),
+                interests.size(),
+                forSaleProperties.size(),
                 pairMatchCount
             );
+
             return new NotifyDiagnostics(
-                purchaserCount,
-                interestCount,
-                forSaleCount,
+                purchasers.size(),
+                interests.size(),
+                forSaleProperties.size(),
                 pairMatchCount,
                 sampleInterest,
                 sampleForSale,
                 hints
             );
-        } catch (SQLException exception) {
+        } catch (IllegalStateException exception) {
             throw new IllegalStateException("Failed to load /notify diagnostics", exception);
         }
     }
 
-    private static long queryLong(Connection connection, String sql) throws SQLException {
-        try (Statement st = connection.createStatement();
-             ResultSet rs = st.executeQuery(sql)) {
-            if (!rs.next()) {
-                return 0L;
-            }
-            return rs.getLong(1);
+    private Map<Long, Long> buildSalePriceByProperty() {
+        Map<Long, ListingWithPrices> listingsById = loadListingsWithPrices();
+        Map<Long, List<ListingWithPrices>> byProperty = new HashMap<>();
+        for (ListingWithPrices listing : listingsById.values()) {
+            byProperty.computeIfAbsent(listing.propertyId(), ignored -> new ArrayList<>()).add(listing);
         }
+
+        Map<Long, Long> salePriceByProperty = new HashMap<>();
+        for (Map.Entry<Long, List<ListingWithPrices>> entry : byProperty.entrySet()) {
+            Optional<ListingWithPrices> chosen = entry.getValue().stream()
+                .filter(listing -> !listing.prices().isEmpty())
+                .max(Comparator.comparingLong(ListingWithPrices::listingId));
+            chosen.ifPresent(listing -> salePriceByProperty.put(entry.getKey(), latestPrice(listing.prices())));
+        }
+        return salePriceByProperty;
     }
 
-    private static List<String> distinctPostcodes(Connection connection, String sql) throws SQLException {
-        Set<String> ordered = new LinkedHashSet<>();
-        try (Statement st = connection.createStatement();
-             ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) {
-                String pc = rs.getString("pc");
-                if (pc != null && !pc.isBlank()) {
-                    ordered.add(pc);
+    private static long latestPrice(List<PricePoint> prices) {
+        return prices.stream()
+            .max(Comparator.comparing(PricePoint::date).thenComparingLong(PricePoint::priceId))
+            .map(PricePoint::price)
+            .orElseThrow();
+    }
+
+    private Map<Long, ListingWithPrices> loadListingsWithPrices() {
+        Map<Long, ListingWithPrices> listings = new HashMap<>();
+        for (QueryDocumentSnapshot listingDoc : FirestoreOps.await(
+            FirestoreConfig.db().collection(FirestoreCollections.LISTINGS).get()
+        ).getDocuments()) {
+            Long listingId = listingDoc.getLong(FIELD_LISTING_ID);
+            Long propertyId = listingDoc.getLong(FIELD_PROPERTY_ID);
+            if (listingId == null || propertyId == null) {
+                continue;
+            }
+            List<PricePoint> prices = new ArrayList<>();
+            for (QueryDocumentSnapshot priceDoc : FirestoreOps.await(
+                listingDoc.getReference().collection(FirestoreCollections.LISTING_PRICES).get()
+            ).getDocuments()) {
+                Long priceId = priceDoc.getLong(FIELD_PRICE_ID);
+                String priceDate = priceDoc.getString(FIELD_PRICE_DATE);
+                Long price = priceDoc.getLong(FIELD_PRICE);
+                if (priceDate != null && price != null) {
+                    prices.add(
+                        new PricePoint(
+                            priceId == null ? 0L : priceId,
+                            LocalDate.parse(priceDate),
+                            price
+                        )
+                    );
                 }
             }
+            listings.put(listingId, new ListingWithPrices(listingId, propertyId, prices));
         }
-        return List.copyOf(ordered);
+        return listings;
+    }
+
+    private List<PurchaserRow> loadPurchasers() {
+        List<PurchaserRow> rows = new ArrayList<>();
+        for (QueryDocumentSnapshot snapshot : FirestoreOps.await(
+            FirestoreConfig.db().collection(FirestoreCollections.PURCHASERS).get()
+        ).getDocuments()) {
+            Long purchaserId = snapshot.getLong(FIELD_PURCHASER_ID);
+            if (purchaserId == null) {
+                purchaserId = parseLongOrNull(snapshot.getId());
+            }
+            if (purchaserId == null) {
+                continue;
+            }
+            rows.add(
+                new PurchaserRow(
+                    purchaserId,
+                    nullToEmpty(snapshot.getString(FIELD_EMAIL)),
+                    nullToEmpty(snapshot.getString(FIELD_FIRST_NAME)),
+                    nullToEmpty(snapshot.getString(FIELD_LAST_NAME))
+                )
+            );
+        }
+        return rows;
+    }
+
+    private List<InterestRow> loadInterests() {
+        List<InterestRow> rows = new ArrayList<>();
+        for (QueryDocumentSnapshot snapshot : FirestoreOps.await(
+            FirestoreConfig.db().collection(FirestoreCollections.PURCHASER_INTERESTS).get()
+        ).getDocuments()) {
+            Long purchaserId = snapshot.getLong(FIELD_PURCHASER_ID);
+            String postCode = snapshot.getString(FIELD_POST_CODE);
+            if (purchaserId == null || postCode == null) {
+                continue;
+            }
+            rows.add(new InterestRow(purchaserId, postCode));
+        }
+        return rows;
+    }
+
+    private List<PropertyRow> loadForSaleProperties() {
+        List<PropertyRow> rows = new ArrayList<>();
+        for (QueryDocumentSnapshot snapshot : FirestoreOps.await(
+            FirestoreConfig.db()
+                .collection(FirestoreCollections.PROPERTIES)
+                .whereEqualTo(FIELD_FOR_SALE, true)
+                .get()
+        ).getDocuments()) {
+            Long propertyId = snapshot.getLong(FIELD_PROPERTY_ID);
+            if (propertyId == null) {
+                propertyId = parseLongOrNull(snapshot.getId());
+            }
+            if (propertyId == null) {
+                continue;
+            }
+            Long purchasePrice = snapshot.getLong(FIELD_PURCHASE_PRICE);
+            rows.add(
+                new PropertyRow(
+                    propertyId,
+                    snapshot.getString(FIELD_POST_CODE),
+                    purchasePrice == null ? 0L : purchasePrice,
+                    snapshot.getLong(FIELD_ACCESS_COUNT)
+                )
+            );
+        }
+        return rows;
+    }
+
+    private Map<String, Long> loadPostCodeSearchCounts() {
+        Map<String, Long> counts = new HashMap<>();
+        for (QueryDocumentSnapshot snapshot : FirestoreOps.await(
+            FirestoreConfig.db().collection(FirestoreCollections.POST_CODE_SEARCH_STATS).get()
+        ).getDocuments()) {
+            String postCode = snapshot.getString(FIELD_POST_CODE);
+            if (postCode == null) {
+                postCode = snapshot.getId();
+            }
+            Long searchCount = snapshot.getLong(FIELD_SEARCH_COUNT);
+            long count = searchCount == null ? 0L : searchCount;
+            counts.put(postCode, count);
+            counts.put(PostcodeUtil.trim(postCode), count);
+        }
+        return counts;
+    }
+
+    private static long lookupSearchCount(Map<String, Long> counts, String postCode) {
+        if (postCode == null) {
+            return 0L;
+        }
+        Long exact = counts.get(postCode);
+        if (exact != null) {
+            return exact;
+        }
+        return counts.getOrDefault(PostcodeUtil.trim(postCode), 0L);
+    }
+
+    private static List<String> distinctTrimmedPostcodes(List<String> postcodes) {
+        Set<String> ordered = new LinkedHashSet<>();
+        postcodes.stream()
+            .map(PostcodeUtil::trim)
+            .filter(pc -> !pc.isEmpty())
+            .sorted()
+            .forEach(ordered::add);
+        return ordered.stream().limit(20).toList();
     }
 
     private static List<String> buildHints(
@@ -211,13 +339,13 @@ public class NotifyDAO {
     ) {
         List<String> hints = new ArrayList<>();
         if (purchaserCount == 0) {
-            hints.add("Table purchaser has no rows.");
+            hints.add("Collection purchasers has no documents.");
         }
         if (interestCount == 0) {
-            hints.add("Table purchaser_interest has no rows — nothing to match to postcodes.");
+            hints.add("Collection purchaser_interests has no documents — nothing to match to postcodes.");
         }
         if (forSaleCount == 0) {
-            hints.add("No property rows have for_sale = true — /notify only includes for-sale properties.");
+            hints.add("No property documents have forSale = true — /notify only includes for-sale properties.");
         }
         if (interestCount > 0 && forSaleCount > 0 && pairMatchCount == 0) {
             hints.add(
@@ -237,5 +365,32 @@ public class NotifyDAO {
             hints.add("No issues detected from counts alone.");
         }
         return List.copyOf(hints);
+    }
+
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
+    private static Long parseLongOrNull(String value) {
+        try {
+            return value == null ? null : Long.parseLong(value);
+        } catch (NumberFormatException exception) {
+            return null;
+        }
+    }
+
+    private record PurchaserRow(long purchaserId, String email, String firstName, String lastName) {
+    }
+
+    private record InterestRow(long purchaserId, String postCode) {
+    }
+
+    private record PropertyRow(long propertyId, String postCode, long purchasePrice, Long accessCount) {
+    }
+
+    private record ListingWithPrices(long listingId, long propertyId, List<PricePoint> prices) {
+    }
+
+    private record PricePoint(long priceId, LocalDate date, long price) {
     }
 }

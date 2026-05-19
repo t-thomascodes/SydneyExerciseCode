@@ -91,10 +91,9 @@ public class REServer {
         LOG.info("JVM working directory (user.dir): {}", System.getProperty("user.dir"));
         LOG.info("Resolved ./.env path: {} — exists: {}", dotEnv, Files.isRegularFile(dotEnv));
         LOG.info(
-            "Database settings present (env or .env): SUPABASE_DB_URL={}, SUPABASE_DB_USER={}, SUPABASE_DB_PASSWORD={}",
-            envPresent("SUPABASE_DB_URL"),
-            envPresent("SUPABASE_DB_USER"),
-            envPresent("SUPABASE_DB_PASSWORD")
+            "Firestore settings present (env or .env): GOOGLE_APPLICATION_CREDENTIALS={}, FIRESTORE_PROJECT_ID={}",
+            envPresent("GOOGLE_APPLICATION_CREDENTIALS"),
+            envPresent("FIRESTORE_PROJECT_ID")
         );
     }
 

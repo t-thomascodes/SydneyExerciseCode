@@ -1,140 +1,152 @@
 package listing;
 
-import app.DatabaseConfig;
-
-import java.sql.Connection;
-import java.sql.Date;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import app.FirestoreCollections;
+import app.FirestoreConfig;
+import app.FirestoreCounters;
+import app.FirestoreOps;
+import com.google.cloud.firestore.CollectionReference;
+import com.google.cloud.firestore.DocumentReference;
+import com.google.cloud.firestore.DocumentSnapshot;
+import com.google.cloud.firestore.Firestore;
+import com.google.cloud.firestore.Query;
+import com.google.cloud.firestore.QueryDocumentSnapshot;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public class ListingDAO {
 
+    private static final String FIELD_LISTING_ID = "listingId";
+    private static final String FIELD_PROPERTY_ID = "propertyId";
+    private static final String FIELD_DATE_LISTED = "dateListed";
+    private static final String FIELD_FOR_SALE = "forSale";
+    private static final String FIELD_PRICE_ID = "priceId";
+    private static final String FIELD_PRICE_DATE = "priceDate";
+    private static final String FIELD_PRICE = "price";
+
     public long createListing(long propertyId, LocalDate listedOn, long initialPrice) {
-        String insertListing =
-            "insert into listing (property_id, datelisted, forsale) values (?, ?, true)";
-        String insertPrice =
-            "insert into listing_price (listing_id, price_date, price) values (?, ?, ?)";
+        Firestore db = FirestoreConfig.db();
+        try {
+            return FirestoreOps.await(
+                db.runTransaction(transaction -> {
+                    long listingId = FirestoreCounters.nextListingId(transaction, db);
+                    long priceId = FirestoreCounters.nextPriceId(transaction, db);
 
-        try (Connection connection = DatabaseConfig.connect()) {
-            connection.setAutoCommit(false);
-            try {
-                long listingId;
-                try (PreparedStatement listingStatement =
-                         connection.prepareStatement(insertListing, Statement.RETURN_GENERATED_KEYS)) {
-                    listingStatement.setLong(1, propertyId);
-                    listingStatement.setDate(2, Date.valueOf(listedOn));
-                    listingStatement.executeUpdate();
-                    try (ResultSet keys = listingStatement.getGeneratedKeys()) {
-                        if (!keys.next()) {
-                            throw new IllegalStateException("insert into listing did not return listing_id");
-                        }
-                        listingId = keys.getLong(1);
-                    }
-                }
+                    DocumentReference listingRef = db.collection(FirestoreCollections.LISTINGS)
+                        .document(String.valueOf(listingId));
+                    Map<String, Object> listing = new HashMap<>();
+                    listing.put(FIELD_LISTING_ID, listingId);
+                    listing.put(FIELD_PROPERTY_ID, propertyId);
+                    listing.put(FIELD_DATE_LISTED, listedOn.toString());
+                    listing.put(FIELD_FOR_SALE, true);
+                    transaction.set(listingRef, listing);
 
-                try (PreparedStatement priceStatement = connection.prepareStatement(insertPrice)) {
-                    priceStatement.setLong(1, listingId);
-                    priceStatement.setDate(2, Date.valueOf(listedOn));
-                    priceStatement.setLong(3, initialPrice);
-                    priceStatement.executeUpdate();
-                }
+                    DocumentReference priceRef = listingRef
+                        .collection(FirestoreCollections.LISTING_PRICES)
+                        .document(String.valueOf(priceId));
+                    Map<String, Object> price = new HashMap<>();
+                    price.put(FIELD_PRICE_ID, priceId);
+                    price.put(FIELD_PRICE_DATE, listedOn.toString());
+                    price.put(FIELD_PRICE, initialPrice);
+                    transaction.set(priceRef, price);
 
-                connection.commit();
-                return listingId;
-            } catch (SQLException exception) {
-                connection.rollback();
-                throw exception;
-            } finally {
-                connection.setAutoCommit(true);
-            }
-        } catch (SQLException exception) {
+                    return listingId;
+                })
+            );
+        } catch (IllegalStateException exception) {
             throw new IllegalStateException("Failed to create listing", exception);
         }
     }
 
     public void addPrice(long listingId, LocalDate effectiveDate, long price) {
-        String sql =
-            "insert into listing_price (listing_id, price_date, price) values (?, ?, ?)";
-
-        try (Connection connection = DatabaseConfig.connect();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
-
-            statement.setLong(1, listingId);
-            statement.setDate(2, Date.valueOf(effectiveDate));
-            statement.setLong(3, price);
-            statement.executeUpdate();
-        } catch (SQLException exception) {
+        Firestore db = FirestoreConfig.db();
+        DocumentReference listingRef = db.collection(FirestoreCollections.LISTINGS)
+            .document(String.valueOf(listingId));
+        try {
+            DocumentSnapshot listing = FirestoreOps.await(listingRef.get());
+            if (!listing.exists()) {
+                throw new IllegalStateException("Listing not found: " + listingId);
+            }
+            long priceId = FirestoreCounters.nextPriceId(db);
+            DocumentReference priceRef = listingRef
+                .collection(FirestoreCollections.LISTING_PRICES)
+                .document(String.valueOf(priceId));
+            Map<String, Object> data = new HashMap<>();
+            data.put(FIELD_PRICE_ID, priceId);
+            data.put(FIELD_PRICE_DATE, effectiveDate.toString());
+            data.put(FIELD_PRICE, price);
+            FirestoreOps.await(priceRef.set(data));
+        } catch (IllegalStateException exception) {
             throw new IllegalStateException("Failed to add listing price", exception);
         }
     }
 
     public Optional<ListingDetail> getListing(long listingId) {
-        String listingSql =
-            "select listing_id, property_id, datelisted from listing where listing_id = ?";
-        String pricesSql =
-            "select price_date, price from listing_price where listing_id = ? "
-                + "order by price_date asc, price_id asc";
-
-        try (Connection connection = DatabaseConfig.connect()) {
-            ListingDetail detail;
-            try (PreparedStatement statement = connection.prepareStatement(listingSql)) {
-                statement.setLong(1, listingId);
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    if (!resultSet.next()) {
-                        return Optional.empty();
-                    }
-                    detail = new ListingDetail();
-                    detail.setListingID(String.valueOf(resultSet.getLong("listing_id")));
-                    detail.setPropertyID(String.valueOf(resultSet.getLong("property_id")));
-                    detail.setListedOn(resultSet.getDate("datelisted").toLocalDate().toString());
-                }
+        Firestore db = FirestoreConfig.db();
+        DocumentReference listingRef = db.collection(FirestoreCollections.LISTINGS)
+            .document(String.valueOf(listingId));
+        try {
+            DocumentSnapshot listing = FirestoreOps.await(listingRef.get());
+            if (!listing.exists()) {
+                return Optional.empty();
             }
-
-            List<ListingPricePoint> prices = new ArrayList<>();
-            try (PreparedStatement statement = connection.prepareStatement(pricesSql)) {
-                statement.setLong(1, listingId);
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    while (resultSet.next()) {
-                        String date = resultSet.getDate("price_date").toLocalDate().toString();
-                        String price = String.valueOf(resultSet.getLong("price"));
-                        prices.add(new ListingPricePoint(date, price));
-                    }
-                }
-            }
-            detail.setPrices(prices);
+            ListingDetail detail = new ListingDetail();
+            detail.setListingID(String.valueOf(listing.getLong(FIELD_LISTING_ID)));
+            detail.setPropertyID(String.valueOf(listing.getLong(FIELD_PROPERTY_ID)));
+            detail.setListedOn(listing.getString(FIELD_DATE_LISTED));
+            detail.setPrices(loadPrices(listingRef));
             return Optional.of(detail);
-        } catch (SQLException exception) {
+        } catch (IllegalStateException exception) {
             throw new IllegalStateException("Failed to load listing " + listingId, exception);
         }
     }
 
     public List<ListingDetail> getListingsForProperty(long propertyId) {
-        String idsSql = "select listing_id from listing where property_id = ? order by listing_id";
-        List<Long> ids = new ArrayList<>();
-
-        try (Connection connection = DatabaseConfig.connect();
-             PreparedStatement statement = connection.prepareStatement(idsSql)) {
-
-            statement.setLong(1, propertyId);
-            try (ResultSet resultSet = statement.executeQuery()) {
-                while (resultSet.next()) {
-                    ids.add(resultSet.getLong("listing_id"));
+        try {
+            Query query = FirestoreConfig.db()
+                .collection(FirestoreCollections.LISTINGS)
+                .whereEqualTo(FIELD_PROPERTY_ID, propertyId)
+                .orderBy(FIELD_LISTING_ID);
+            List<ListingDetail> out = new ArrayList<>();
+            for (QueryDocumentSnapshot snapshot : FirestoreOps.await(query.get()).getDocuments()) {
+                Long listingId = snapshot.getLong(FIELD_LISTING_ID);
+                if (listingId != null) {
+                    getListing(listingId).ifPresent(out::add);
                 }
             }
-        } catch (SQLException exception) {
+            return out;
+        } catch (IllegalStateException exception) {
             throw new IllegalStateException("Failed to list listings for property " + propertyId, exception);
         }
+    }
 
-        List<ListingDetail> out = new ArrayList<>();
-        for (Long id : ids) {
-            getListing(id).ifPresent(out::add);
+    private List<ListingPricePoint> loadPrices(DocumentReference listingRef) {
+        CollectionReference prices = listingRef.collection(FirestoreCollections.LISTING_PRICES);
+        List<PriceRow> rows = new ArrayList<>();
+        for (QueryDocumentSnapshot snapshot : FirestoreOps.await(prices.get()).getDocuments()) {
+            Long priceId = snapshot.getLong(FIELD_PRICE_ID);
+            String priceDate = snapshot.getString(FIELD_PRICE_DATE);
+            Long amount = snapshot.getLong(FIELD_PRICE);
+            if (priceDate != null && amount != null) {
+                rows.add(new PriceRow(
+                    priceId == null ? 0L : priceId,
+                    LocalDate.parse(priceDate),
+                    amount
+                ));
+            }
         }
-        return out;
+        rows.sort(Comparator.comparing(PriceRow::date).thenComparingLong(PriceRow::priceId));
+        List<ListingPricePoint> points = new ArrayList<>(rows.size());
+        for (PriceRow row : rows) {
+            points.add(new ListingPricePoint(row.date().toString(), String.valueOf(row.price())));
+        }
+        return points;
+    }
+
+    private record PriceRow(long priceId, LocalDate date, long price) {
     }
 }

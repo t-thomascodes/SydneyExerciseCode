@@ -1,6 +1,6 @@
 package property;
 
-import app.DatabaseConfig;
+import app.FirestoreConfig;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
@@ -10,26 +10,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Integration tests for property access and postcode search counters.
- * Requires Supabase credentials in the environment or {@code REServer/.env}.
+ * Requires Firebase credentials in the environment or {@code REServer/.env}.
  */
-@EnabledIf("property.PropertyDAOMetricsTest#databaseConfigured")
+@EnabledIf("property.PropertyDAOMetricsTest#firestoreConfigured")
 class PropertyDAOMetricsTest {
 
     private static final long TEST_PROPERTY_ID = 9_999_999_000_001L;
 
     private final PropertyDAO dao = new PropertyDAO();
 
-    public static boolean databaseConfigured() {
-        try (var connection = DatabaseConfig.connect()) {
-            return connection != null;
-        } catch (Exception exception) {
-            return false;
-        }
+    public static boolean firestoreConfigured() {
+        return FirestoreConfig.isConfigured();
     }
 
     @BeforeAll
     static void ensureTestProperty() {
-        if (!databaseConfigured()) {
+        if (!firestoreConfigured()) {
             return;
         }
         PropertyDAO setup = new PropertyDAO();
